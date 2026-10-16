@@ -2,18 +2,51 @@
 
 import { Sparkles } from "lucide-react";
 
+/**
+ * Metadata for a single step in the onboarding stepper.
+ */
 export interface OnboardingStepMeta {
+  /**
+   * The title of the step, displayed in the stepper button.
+   */
   title: string;
+  /**
+   * The icon component to display alongside the step title.
+   */
   icon: React.ComponentType<{ className?: string }>;
 }
 
+/**
+ * Props for the OnboardingStepper component.
+ */
 interface OnboardingStepperProps {
+  /**
+   * Array of step metadata defining the structure and visuals of each step.
+   */
   steps: OnboardingStepMeta[];
+  /**
+   * The index of the currently active step (0-indexed).
+   */
   currentStep: number;
+  /**
+   * Indicates whether the entire onboarding process is completed.
+   */
   completed: boolean;
+  /**
+   * Callback fired when a user clicks on a specific step button.
+   *
+   * @param step - The index of the selected step.
+   */
   onGoToStep: (step: number) => void;
 }
 
+/**
+ * OnboardingStepper provides a visual progress indicator for multi-step onboarding processes.
+ * It renders a list of clickable step buttons and highlights the current active step.
+ *
+ * @param props - Component props containing steps, current state, and navigation callbacks.
+ * @returns A React component rendering the stepper header and step indicators.
+ */
 export default function OnboardingStepper({
   steps,
   currentStep,
@@ -47,7 +80,16 @@ export default function OnboardingStepper({
                     key={stepItem.title}
                     type="button"
                     onClick={() => onGoToStep(index)}
-                    className={`rounded-3xl border p-4 text-left transition ${
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onGoToStep(index);
+                      }
+                    }}
+                    tabIndex={0}
+                    aria-label={`${stepItem.title}: ${isDone ? "Completed" : isActive ? "Current step" : "Pending"}`}
+                    aria-current={isActive ? "step" : undefined}
+                    className={`rounded-3xl border p-4 text-left transition focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
                       isActive
                         ? "border-primary bg-primary/10 text-primary"
                         : "border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300"
