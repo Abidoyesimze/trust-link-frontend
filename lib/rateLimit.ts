@@ -1,15 +1,25 @@
 /**
- * Issue #112 — rate limiting for API routes.
+ * Issue #112 / #882 — rate limiting for API routes.
  *
  * Uses @upstash/ratelimit (sliding window) when Upstash Redis is configured via
  * env (UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN). When it is not — local
  * dev, CI, tests — it falls back to an in-memory limiter so routes are still
  * protected and the code path is exercisable without external infrastructure.
+ *
+ * ## Failure policy
+ *
+ * If Redis is configured but unreachable we do NOT silently downgrade to the
+ * per-process map forever. Instead:
+ *   - a `rate_limit_redis_failure` metric is emitted (Sentry), and
+ *   - by default the request is allowed through (fail-open) and served by the
+ *     in-memory limiter, so a Redis outage does not take the whole site down.
+ *
+ * Set `RATE_LIMIT_FAIL_CLOSED=true` to reject requests instead (fail-closed).
  */
 import { Ratelimit } from "@upstash/ratelimit";
 import { Redis } from "@upstash/redis";
 
-import { captureError } from "@/lib/logger";
+import { captureError, captureMessage } from "@/lib/logger";
 
 export interface RateLimitResult {
   success: boolean;
@@ -19,9 +29,23 @@ export interface RateLimitResult {
   reset: number;
 }
 
-/** Requests allowed per window, and the window length in milliseconds. */
-const DEFAULT_LIMIT = 20;
-const DEFAULT_WINDOW_MS = 10_000; // 10s
+/** Fallback quota used when a route does not declare its own. */
+export const DEFAULT_LIMIT = 20;
+export const DEFAULT_WINDOW_MS = 10_000; // 10s
+
+/**
+ * Per-route quotas. Read-only and expensive (mutating / image-rendering) routes
+ * should not share a single bucket: a cheap GET must not be able to exhaust the
+ * budget of a route that costs real CPU.
+ */
+export const RATE_LIMITS = {
+  /** GET /escrow — cheap list read. */
+  escrowRead: { limit: 20, windowMs: 10_000 },
+  /** POST /escrow + PATCH /escrow/:id/ship — writes against the backend. */
+  escrowWrite: { limit: 15, windowMs: 10_000 },
+  /** GET /api/og — ImageResponse rasterisation is CPU-bound. */
+  og: { limit: 20, windowMs: 60_000 },
+} as const;
 
 // ── In-memory fallback (per-process; fine for dev/CI/single instance) ─────────
 
@@ -75,22 +99,22 @@ function getUpstashLimiter(): Ratelimit | null {
   return upstashLimiter;
 }
 
+/** Test-only: drops the memoised Upstash limiter. */
+export function __resetUpstashLimiter(): void {
+  upstashLimiter = null;
+}
+
 /**
  * Check whether `identifier` (typically the client IP) is within its rate quota.
  * Uses Upstash when configured, otherwise the in-memory fallback.
- *
- * If Upstash Redis fails (network unreachable, timeout, etc.), the error is
- * logged to Sentry and the request fails open (succeeds) to avoid blocking
- * legitimate traffic. In-memory fallback is then used for subsequent requests.
  */
 export async function checkRateLimit(
   identifier: string,
   limit: number = DEFAULT_LIMIT,
   windowMs: number = DEFAULT_WINDOW_MS
 ): Promise<RateLimitResult> {
-  let limiter: Ratelimit | null = null;
   try {
-    limiter = getUpstashLimiter();
+    const limiter = getUpstashLimiter();
     if (limiter) {
       const res = await limiter.limit(identifier);
       return {
@@ -101,30 +125,108 @@ export async function checkRateLimit(
       };
     }
   } catch (error) {
-    // Log Redis connection failure to Sentry but don't block the request
+    // Report the outage as a first-class metric rather than a bare console line.
     captureError(error, {
       scope: "api",
       action: "rateLimitRedisFailure",
       extra: { identifier, limit, windowMs },
     });
+    captureMessage("rate_limit_redis_failure", {
+      scope: "api",
+      level: "warning",
+      tags: { metric: "rate_limit_redis_failure" },
+      extra: { identifier, limit, windowMs },
+    });
 
-    // Fail open: allow the request through and fall back to in-memory limiter
-    // This prevents Redis outages from taking down the entire service
+    if (process.env.RATE_LIMIT_FAIL_CLOSED === "true") {
+      // Fail closed: deny the request until Redis is reachable again.
+      return { success: false, limit, remaining: 0, reset: Date.now() + windowMs };
+    }
+
+    // Fail open (documented default): serve the request from the per-process
+    // limiter. We intentionally keep `upstashLimiter` memoised so the next
+    // request retries Redis instead of permanently downgrading.
     console.warn("Rate limiter Redis failure, falling back to in-memory");
-    upstashLimiter = null; // Clear the failed limiter to use memory fallback
   }
+
   return memoryLimit(identifier, limit, windowMs);
 }
 
-/** Derive a stable client identifier from a request's forwarded headers. */
-export function getClientId(request: Request): string {
-  // Defensive: in some call sites (e.g. unit tests invoking a handler directly)
-  // a Request may not be supplied. Treat that as the anonymous bucket.
+// ── Client identification ─────────────────────────────────────────────────────
+
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const IPV6_RE = /^[0-9a-fA-F:]+$/;
+
+function isValidIpv4(value: string): boolean {
+  const match = IPV4_RE.exec(value);
+  if (!match) return false;
+  return match.slice(1).every((octet) => {
+    if (octet.length > 1 && octet.startsWith("0")) return false; // no leading zeros
+    const n = Number(octet);
+    return n >= 0 && n <= 255;
+  });
+}
+
+function isValidIpv6(value: string): boolean {
+  if (!value.includes(":") || !IPV6_RE.test(value)) return false;
+  // At most one `::` compression is allowed.
+  return value.split("::").length <= 2;
+}
+
+/** True for syntactically valid IPv4 or IPv6 addresses. */
+export function isValidIp(value: string): boolean {
+  return isValidIpv4(value) || isValidIpv6(value);
+}
+
+/** Returns the first syntactically valid IP in a comma-separated header. */
+function firstValidIp(header: string | null | undefined): string | null {
+  if (!header) return null;
+  for (const part of header.split(",")) {
+    const candidate = part.trim();
+    if (candidate && isValidIp(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Derive a client identifier from a request's headers.
+ *
+ * Only syntactically valid IPs are accepted, and proxy headers that the platform
+ * sets (`x-real-ip`, `cf-connecting-ip`) are preferred over the client-
+ * controllable `x-forwarded-for`. Invalid values are ignored rather than turned
+ * into arbitrary bucket keys.
+ */
+export function getClientId(request: Request | null | undefined): string {
   const headers = request?.headers;
   if (!headers) return "anonymous";
-  const forwarded = headers.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0].trim();
-  return headers.get("x-real-ip") ?? "anonymous";
+
+  return (
+    firstValidIp(headers.get("x-real-ip")) ??
+    firstValidIp(headers.get("cf-connecting-ip")) ??
+    firstValidIp(headers.get("x-forwarded-for")) ??
+    "anonymous"
+  );
+}
+
+function randomId(): string {
+  const cryptoObj = globalThis.crypto as Crypto | undefined;
+  if (cryptoObj && typeof cryptoObj.randomUUID === "function") {
+    return cryptoObj.randomUUID();
+  }
+  return Math.random().toString(36).slice(2);
+}
+
+/**
+ * Build the rate-limit bucket key for a request.
+ *
+ * Identified clients share a stable `ip:<addr>` bucket. Callers we cannot
+ * identify (no valid IP header) get a unique bucket instead of a shared
+ * `anonymous` one, so a single headerless client cannot exhaust a quota that
+ * every other anonymous caller also draws from.
+ */
+export function getRateLimitKey(request: Request | null | undefined): string {
+  const id = getClientId(request);
+  return id === "anonymous" ? `anonymous:${randomId()}` : `ip:${id}`;
 }
 
 /**
@@ -137,7 +239,7 @@ export async function enforceRateLimit(
   limit: number = DEFAULT_LIMIT,
   windowMs: number = DEFAULT_WINDOW_MS
 ): Promise<Response | null> {
-  const id = getClientId(request);
+  const id = getRateLimitKey(request);
   const result = await checkRateLimit(id, limit, windowMs);
 
   if (!result.success) {

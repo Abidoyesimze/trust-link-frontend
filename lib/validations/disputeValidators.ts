@@ -1,20 +1,38 @@
 import type { DisputeFormValues } from "./dispute";
+import {
+  DISPUTE_ERRORS,
+  DISPUTE_FIELD_LIMITS,
+  EMAIL_REGEX,
+  getDisputeFileError,
+  MAX_DISPUTE_FILES,
+} from "./dispute";
 
 type ErrorRecord = Partial<Record<keyof DisputeFormValues, string>>;
 
 export function validateStep1Data(formData: DisputeFormValues): ErrorRecord {
   const newErrors: ErrorRecord = {};
 
-  if (!formData.name.trim()) {
-    newErrors.name = "Name is required";
+  const name = formData.name?.trim() ?? "";
+  if (!name) {
+    newErrors.name = DISPUTE_ERRORS.nameRequired;
+  } else if (name.length > DISPUTE_FIELD_LIMITS.name) {
+    newErrors.name = DISPUTE_ERRORS.nameTooLong;
   }
-  if (!formData.email.trim()) {
-    newErrors.email = "Email is required";
-  } else if (!/\S+@\S+\.\S+/.test(formData.email)) {
-    newErrors.email = "Email is invalid";
+
+  const email = formData.email?.trim() ?? "";
+  if (!email) {
+    newErrors.email = DISPUTE_ERRORS.emailRequired;
+  } else if (email.length > DISPUTE_FIELD_LIMITS.email) {
+    newErrors.email = DISPUTE_ERRORS.emailTooLong;
+  } else if (!EMAIL_REGEX.test(email)) {
+    newErrors.email = DISPUTE_ERRORS.emailInvalid;
   }
-  if (!formData.orderNumber.trim()) {
-    newErrors.orderNumber = "Order number is required";
+
+  const orderNumber = formData.orderNumber?.trim() ?? "";
+  if (!orderNumber) {
+    newErrors.orderNumber = DISPUTE_ERRORS.orderNumberRequired;
+  } else if (orderNumber.length > DISPUTE_FIELD_LIMITS.orderNumber) {
+    newErrors.orderNumber = DISPUTE_ERRORS.orderNumberTooLong;
   }
 
   return newErrors;
@@ -23,13 +41,20 @@ export function validateStep1Data(formData: DisputeFormValues): ErrorRecord {
 export function validateStep2Data(formData: DisputeFormValues): ErrorRecord {
   const newErrors: ErrorRecord = {};
 
-  if (!formData.reason) {
-    newErrors.reason = "Reason is required";
+  const reason = formData.reason?.trim() ?? "";
+  if (!reason) {
+    newErrors.reason = DISPUTE_ERRORS.reasonRequired;
+  } else if (reason.length > DISPUTE_FIELD_LIMITS.reason) {
+    newErrors.reason = DISPUTE_ERRORS.reasonTooLong;
   }
-  if (!formData.description.trim()) {
-    newErrors.description = "Description is required";
-  } else if (formData.description.length < 20) {
-    newErrors.description = "Description must be at least 20 characters";
+
+  const description = formData.description?.trim() ?? "";
+  if (!description) {
+    newErrors.description = DISPUTE_ERRORS.descriptionRequired;
+  } else if (description.length < 20) {
+    newErrors.description = DISPUTE_ERRORS.descriptionTooShort;
+  } else if (description.length > DISPUTE_FIELD_LIMITS.description) {
+    newErrors.description = DISPUTE_ERRORS.descriptionTooLong;
   }
 
   return newErrors;
@@ -39,7 +64,21 @@ export function validateStep3Data(formData: DisputeFormValues): ErrorRecord {
   const newErrors: ErrorRecord = {};
 
   if (formData.files.length === 0) {
-    newErrors.files = "Please upload at least one file as evidence";
+    newErrors.files = DISPUTE_ERRORS.filesRequired;
+    return newErrors;
+  }
+
+  if (formData.files.length > MAX_DISPUTE_FILES) {
+    newErrors.files = DISPUTE_ERRORS.filesTooMany;
+    return newErrors;
+  }
+
+  const fileError = formData.files
+    .map((file) => getDisputeFileError(file))
+    .find((message): message is string => message !== null);
+
+  if (fileError) {
+    newErrors.files = fileError;
   }
 
   return newErrors;
@@ -49,7 +88,7 @@ export function validateStep4Data(formData: DisputeFormValues): ErrorRecord {
   const newErrors: ErrorRecord = {};
 
   if (!formData.agreeToTerms) {
-    newErrors.agreeToTerms = "You must agree to the terms";
+    newErrors.agreeToTerms = DISPUTE_ERRORS.agreeToTerms;
   }
 
   return newErrors;

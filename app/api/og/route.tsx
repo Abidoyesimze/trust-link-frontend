@@ -1,9 +1,24 @@
 import { ImageResponse } from 'next/og';
 import { NextRequest } from 'next/server';
 
+import { requireAuth } from '@/lib/auth';
+import { enforceRateLimit, RATE_LIMITS } from '@/lib/rateLimit';
+
 
 
 export async function GET(request: NextRequest) {
+  // Rasterising an ImageResponse is CPU-bound, so it is rate-limited and
+  // requires an authenticated caller before any rendering happens.
+  const limited = await enforceRateLimit(
+    request,
+    RATE_LIMITS.og.limit,
+    RATE_LIMITS.og.windowMs
+  );
+  if (limited) return limited;
+
+  const auth = requireAuth(request);
+  if (!auth.ok) return auth.response;
+
   try {
     const { searchParams } = new URL(request.url);
     const title = searchParams.get('title');

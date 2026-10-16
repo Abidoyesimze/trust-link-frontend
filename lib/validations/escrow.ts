@@ -3,9 +3,13 @@ import { z } from "zod";
 export const shippingOptions = ["Same day", "1-3 days", "1 week", "Custom"] as const;
 
 export const EscrowCreateSchema = z.object({
-  itemName: z.string().min(1, "Item name is required."),
+  // The `error` option customises zod's built-in "expected string, received
+  // undefined" for a *missing* field; the `.min(1)` covers an empty string.
+  itemName: z
+    .string({ error: "Item name is required." })
+    .min(1, "Item name is required."),
   priceUSDC: z
-    .string()
+    .string({ error: "Price is required." })
     .min(1, "Price is required.")
     .refine(
       (val) => {
@@ -14,8 +18,10 @@ export const EscrowCreateSchema = z.object({
       },
       "Price must be a positive number."
     ),
-  description: z.string().min(1, "Description is required."),
-  shippingWindow: z.enum(shippingOptions),
+  description: z
+    .string({ error: "Description is required." })
+    .min(1, "Description is required."),
+  shippingWindow: z.enum(shippingOptions, { error: "Invalid shipping window." }),
 }).strict();
 
 export type EscrowCreateValues = z.infer<typeof EscrowCreateSchema>;

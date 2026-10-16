@@ -6,16 +6,89 @@ import type { Escrow } from '@/types';
 // keeps them out of the initial JS payload and lets bundlers split them into
 // their own on-demand chunk. See #653.
 
+/** A4 dimensions in millimetres. */
+const A4_WIDTH_MM = 210;
+const A4_HEIGHT_MM = 297;
+
+/**
+ * Locale and time-zone used for every date printed in an export. Pinning both
+ * makes the output deterministic across the server, CI and the user's browser
+ * (an unpinned `toLocaleString()` renders differently in each environment).
+ */
+const PDF_LOCALE = 'en-US';
+const PDF_TIMEZONE = 'UTC';
+
 export interface PDFExportOptions {
   filename?: string;
   title?: string;
 }
 
 /**
+ * Formats a timestamp for a PDF export using a pinned locale and time zone.
+ *
+ * @param value - A `Date`, ISO string, epoch millis, or nothing.
+ * @param fallback - Returned when the value is missing or unparseable.
+ * @returns A stable, human-readable timestamp, never `"Invalid Date"`.
+ */
+export function formatDateTime(
+  value: string | number | Date | null | undefined,
+  fallback = 'N/A'
+): string {
+  if (value === null || value === undefined || value === '') return fallback;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return fallback;
+  return date.toLocaleString(PDF_LOCALE, { timeZone: PDF_TIMEZONE });
+}
+
+/**
+ * Truncates an identifier to `start…end` characters for display, leaving short
+ * values untouched so an id like `abc` is never rendered as `abc...abc`.
+ */
+export function truncateForDisplay(value: string, start = 6, end = 6): string {
+  if (!value) return value;
+  if (value.length <= start + end) return value;
+  return `${value.slice(0, start)}...${value.slice(-end)}`;
+}
+
+/**
+ * Sanitises a filename destined for `pdf.save()`. Strips directory traversal,
+ * control/unsafe characters and guarantees a `.pdf` extension so a malicious
+ * escrow id cannot influence the saved path.
+ */
+export function sanitizePdfFilename(
+  filename: string,
+  fallback = 'export.pdf'
+): string {
+  const base = String(filename ?? '').trim();
+  if (!base) return fallback;
+
+  const lastSegment = base.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? '';
+  const sanitized = lastSegment
+    // Keep word chars, dots and dashes; replace everything else.
+    .replace(/[^\w.\-]+/g, '_')
+    // No leading dots (hidden files / traversal remnants).
+    .replace(/^\.+/, '')
+    .trim();
+
+  if (!sanitized) return fallback;
+  return /\.pdf$/i.test(sanitized) ? sanitized : `${sanitized}.pdf`;
+}
+
+/** Throws when a receipt total is not a finite, non-negative number. */
+function assertValidTotal(value: number, label: string): void {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`Invalid receipt ${label}: expected a finite, non-negative number.`);
+  }
+}
+
+/**
  * Renders an HTML element to a multi-page A4 PDF and triggers a browser download.
  *
- * Uses `html2canvas` to rasterise the element at 2× resolution, then tiles the
- * resulting image across as many jsPDF pages as necessary.
+ * Uses `html2canvas` to rasterise the element at 2× resolution, then slices the
+ * resulting bitmap vertically so each page receives a distinct region at the top
+ * of the page. Slicing (rather than drawing the whole image at a shifting
+ * negative offset) avoids re-rasterising the same bitmap and keeps page breaks
+ * aligned to the source pixels.
  *
  * @param element - The DOM node to render (must be present in the document).
  * @param options - Optional filename and title overrides.
@@ -42,24 +115,66 @@ export async function generatePDFFromElement(
       useCORS: true,
     });
 
-    const imgWidth = 210; // A4 width in mm
-    const pageHeight = 297; // A4 height in mm
-    let heightLeft = canvas.height * imgWidth / canvas.width;
-    let position = 0;
+    const imgWidth = A4_WIDTH_MM; // A4 width in mm
+    const pageHeight = A4_HEIGHT_MM; // A4 height in mm
 
     const pdf = new jsPDF('p', 'mm', 'a4');
-    const imgData = canvas.toDataURL('image/png');
 
-    while (heightLeft > 0) {
-      pdf.addImage(imgData, 'PNG', 0, position, imgWidth, (heightLeft * imgWidth) / canvas.width);
-      heightLeft -= pageHeight;
-      position -= pageHeight;
-      if (heightLeft > 0) {
-        pdf.addPage();
-      }
+    // Total rendered height once scaled to the page width.
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    const scale = canvas.width / imgWidth; // px per mm
+
+    if (!(imgHeight > 0) || !(scale > 0)) {
+      // Degenerate (zero-size) canvas — nothing meaningful to render.
+      pdf.save(sanitizePdfFilename(filename));
+      return;
     }
 
-    pdf.save(filename);
+    const totalPages = Math.max(1, Math.ceil(imgHeight / pageHeight));
+
+    for (let page = 0; page < totalPages; page += 1) {
+      if (page > 0) pdf.addPage();
+
+      const offsetMm = page * pageHeight;
+      const remainingMm = imgHeight - offsetMm;
+      const sliceHeightMm = Math.min(pageHeight, remainingMm);
+
+      // Source pixel region for this page.
+      const sourceY = Math.round(offsetMm * scale);
+      const sourceHeight = Math.max(
+        1,
+        Math.min(canvas.height - sourceY, Math.round(sliceHeightMm * scale))
+      );
+
+      const sliceCanvas = document.createElement('canvas');
+      sliceCanvas.width = canvas.width;
+      sliceCanvas.height = sourceHeight;
+      const context = sliceCanvas.getContext('2d');
+      if (context) {
+        context.drawImage(
+          canvas,
+          0,
+          sourceY,
+          canvas.width,
+          sourceHeight,
+          0,
+          0,
+          canvas.width,
+          sourceHeight
+        );
+      }
+
+      pdf.addImage(
+        sliceCanvas.toDataURL('image/png'),
+        'PNG',
+        0,
+        0,
+        imgWidth,
+        sliceHeightMm
+      );
+    }
+
+    pdf.save(sanitizePdfFilename(filename));
   } catch (error) {
     console.error('Error generating PDF:', error);
     throw new Error('Failed to generate PDF');
@@ -87,20 +202,26 @@ export function formatTransactionHistoryData(escrows: Escrow[]): {
     buyerId: string;
   }>;
 } {
-  const transactions = escrows.map((escrow) => ({
-    id: escrow.id,
-    item: escrow.item,
-    amount: escrow.amount,
-    status: escrow.status,
-    createdAt: new Date(escrow.createdAt).toLocaleString(),
-    buyerId: escrow.buyerId ? `${escrow.buyerId.slice(0, 6)}...${escrow.buyerId.slice(-6)}` : 'N/A',
-  }));
+  const transactions = escrows.map((escrow) => {
+    // Guard against non-finite amounts so the report never prints "NaN".
+    const amount = Number.isFinite(escrow.amount) ? escrow.amount : 0;
+    return {
+      id: escrow.id,
+      item: escrow.item,
+      amount,
+      status: escrow.status,
+      createdAt: formatDateTime(escrow.createdAt),
+      buyerId: escrow.buyerId ? truncateForDisplay(escrow.buyerId, 6, 6) : 'N/A',
+    };
+  });
 
   const statusBreakdown: Record<string, number> = {};
   let totalAmount = 0;
 
   escrows.forEach((escrow) => {
-    totalAmount += escrow.amount;
+    if (Number.isFinite(escrow.amount)) {
+      totalAmount += escrow.amount;
+    }
     statusBreakdown[escrow.status] = (statusBreakdown[escrow.status] || 0) + 1;
   });
 
@@ -148,7 +269,7 @@ export async function generateSummaryPDF(
 
   pdf.setFontSize(10);
   pdf.setFont('helvetica', 'normal');
-  const generatedDate = new Date().toLocaleString();
+  const generatedDate = formatDateTime(new Date());
   pdf.text(`Generated on: ${generatedDate}`, margin, yPosition);
   yPosition += 8;
   pdf.text(`Vendor ID: ${vendorId}`, margin, yPosition);
@@ -192,7 +313,8 @@ export async function generateSummaryPDF(
   pdf.setFont('helvetica', 'bold');
   pdf.setFontSize(9);
   pdf.setFillColor(240, 240, 240);
-  const colWidths = [35, 45, 25, 25, 40, 30];
+  // Column widths MUST sum to contentWidth (180mm) so the table spans the page.
+  const colWidths = [30, 40, 25, 20, 35, 30];
   const headers = ['Item', 'Buyer ID', 'Amount', 'Status', 'Date', 'Transaction ID'];
 
   let xPosition = margin;
@@ -217,6 +339,13 @@ export async function generateSummaryPDF(
       yPosition = margin;
     }
 
+    // Alternating row background is painted BEFORE the text so the glyphs are
+    // never covered by a later `rect('F')`.
+    if (index % 2 === 0) {
+      pdf.setFillColor(250, 250, 250);
+      pdf.rect(margin, yPosition - 5, contentWidth, 5, 'F');
+    }
+
     const rowData = [
       transaction.item.substring(0, 20),
       transaction.buyerId,
@@ -232,25 +361,23 @@ export async function generateSummaryPDF(
       xPosition += colWidths[i];
     });
 
-    // Alternating row background
-    if (index % 2 === 0) {
-      pdf.setFillColor(250, 250, 250);
-      pdf.rect(margin, yPosition - 5, contentWidth, 5, 'F');
-    }
-
     yPosition += 6;
   });
 
-  // Footer
+  // Footer — paginate first so it never prints over the final table row.
   pdf.setFontSize(8);
   pdf.setFont('helvetica', 'normal');
+  if (yPosition > pageHeight - margin - 10) {
+    pdf.addPage();
+    yPosition = margin;
+  }
   pdf.text(
     'This is an automatically generated report from TrustLink.',
     margin,
     pageHeight - 10
   );
 
-  pdf.save(filename);
+  pdf.save(sanitizePdfFilename(filename, 'transaction-history.pdf'));
 }
 
 /** TrustLink brand primary (`#1B2A6B`) as jsPDF RGB components. */
@@ -285,6 +412,8 @@ export interface ReceiptData {
  *
  * @param receipt - Escrow, item, amount, transaction hash, and timestamp.
  * @param filename - Output filename (defaults to `trustlink-receipt-{escrowId}.pdf`).
+ * @throws {Error} When `amount`, `protocolFee` or `total` is negative or not a
+ *   finite number.
  */
 export async function generateReceiptPDF(
   receipt: ReceiptData,
@@ -292,13 +421,19 @@ export async function generateReceiptPDF(
 ): Promise<void> {
   const { default: jsPDF } = await import('jspdf');
 
+  const protocolFee = receipt.protocolFee ?? 0;
+  const total = receipt.total ?? receipt.amount + protocolFee;
+
+  // Reject negative / NaN totals before any rendering happens.
+  assertValidTotal(receipt.amount, 'amount');
+  assertValidTotal(protocolFee, 'protocol fee');
+  assertValidTotal(total, 'total');
+
   const pdf = new jsPDF('p', 'mm', 'a4');
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
   const margin = 15;
 
-  const protocolFee = receipt.protocolFee ?? 0;
-  const total = receipt.total ?? receipt.amount + protocolFee;
   const paidAt = receipt.timestamp ? new Date(receipt.timestamp) : new Date();
 
   const [brandR, brandG, brandB] = BRAND_PRIMARY_RGB;
@@ -319,7 +454,7 @@ export async function generateReceiptPDF(
 
   pdf.setFont('helvetica', 'normal');
   pdf.setFontSize(10);
-  pdf.text(`Issued: ${new Date().toLocaleString()}`, margin, yPosition);
+  pdf.text(`Issued: ${formatDateTime(new Date())}`, margin, yPosition);
   yPosition += 12;
 
   // Transaction details
@@ -336,7 +471,7 @@ export async function generateReceiptPDF(
   const rows: Array<[string, string]> = [
     ['Escrow ID', receipt.escrowId],
     ['Item', receipt.itemName],
-    ['Paid At', paidAt.toLocaleString()],
+    ['Paid At', formatDateTime(paidAt)],
     ['Transaction Hash', receipt.txHash],
   ];
 
@@ -401,5 +536,5 @@ export async function generateReceiptPDF(
     pageHeight - 10
   );
 
-  pdf.save(filename);
+  pdf.save(sanitizePdfFilename(filename, `trustlink-receipt-${receipt.escrowId}.pdf`));
 }
